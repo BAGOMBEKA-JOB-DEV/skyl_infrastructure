@@ -51,25 +51,52 @@ jobs:
       # in a comment where it is made. They still reach code scanning, which is
       # where a suppression can be recorded as a decision rather than a silence.
       #
-      # The directory is scanned with .external_modules skipped: the AWS module
-      # pulls in the community VPC and EKS modules, and their findings are not
-      # actionable from this repository.
+      # The directory is scanned with .terraform skipped: the AWS module pulls
+      # in the community VPC and EKS modules, and their findings are not
+      # actionable from this repository — fixing them means forking upstream.
+      #
+      # On the output flags, which are fiddlier than they look. Three forms were
+      # tried against checkov 3.3.9 directly:
+      #
+      #   -o sarif > file                     writes the ASCII banner into the
+      #                                       file first, so it is not valid JSON
+      #   --output cli --output sarif
+      #     --output-file-path console,DIR    silently writes nothing at all
+      #   --output sarif
+      #     --output-file-path DIR            works
+      #
+      # Note the filename the working form produces: `results_sarif.sarif`, not
+      # `results.sarif`. Assuming the latter is what made this job fail twice.
       - name: checkov
         run: |
+          mkdir -p checkov-out
           checkov \
             --directory . \
             --framework terraform kubernetes helm github_actions \
             --skip-path '.*/\.terraform/.*' \
-            --output cli --output sarif \
-            --output-file-path console,. \
+            --skip-path 'policy/fixtures/.*' \
+            --output sarif \
+            --output-file-path checkov-out \
             --soft-fail
+
+      # SARIF only reaches the Security tab, which nobody opens while watching a
+      # PR. Print the count so the job log says something on its own.
+      - name: summarise
+        if: always()
+        run: |
+          f=checkov-out/results_sarif.sarif
+          if [ ! -f "$f" ]; then echo "::error::checkov produced no SARIF at $f"; exit 1; fi
+          python - "$f" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          n = sum(len(r.get("results", [])) for r in d.get("runs", []))
+          print(f"checkov: {n} finding(s) — see the Security tab, category 'checkov'")
+          PY
 
       - uses: github/codeql-action/upload-sarif@c3400c2f38909e0dcf3c3a41f2030a8217be5d3e # v3
         if: always()
         with:
-          # `--output-file-path console,.` writes results.sarif into the
-          # directory given after the comma.
-          sarif_file: results.sarif
+          sarif_file: checkov-out/results_sarif.sarif
           category: checkov
 
   trivy:

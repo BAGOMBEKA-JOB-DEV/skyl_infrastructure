@@ -7,6 +7,52 @@ which documents the binary's behaviour; this one covers what the cluster adds.
 Every alert in `charts/skyl-gateway/templates/prometheusrule.yaml` links to a
 heading here.
 
+## What a rolling update looks like
+
+The gateway's drain and Kubernetes' pod lifecycle have to interleave correctly,
+and the failure mode when they do not is truncated responses rather than an
+error anyone sees:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as kubelet
+    participant P as gateway pod
+    participant E as Endpoints / ingress
+    participant C as in-flight client
+
+    K->>P: SIGTERM
+    activate P
+    P->>P: logs "draining"
+    P-->>K: /readyz → 503
+    K->>E: remove pod from endpoints
+    Note over P,C: 0–2s · listener still open.<br/>Requests already in flight toward this pod still land.
+
+    P->>P: 2s — listener closes
+    Note over P,C: 2–32s · shutdownGrace.<br/>/healthz stays 200 so the kubelet does not restart it.
+
+    alt work finishes in time
+        P-->>C: responses complete
+        P->>K: exit 0
+    else grace expires
+        P-->>C: streams force-closed, no terminal event
+        P->>P: logs WARN "grace period expired"
+        P->>K: exit 0 — the same code
+    end
+    deactivate P
+
+    Note over K,P: terminationGracePeriodSeconds: 40.<br/>Below that the kubelet SIGKILLs mid-drain.
+```
+
+Step 4 is the one people remove to "simplify". The 2-second window exists
+because a load balancer learns about readiness by polling — close the listener
+the instant you decide to stop and requests already in flight hit a closed
+socket, which looks exactly like a crash.
+
+Both branches exit 0, which is why
+[`SkylGatewayGracePeriodExpired`](#skylgatewaygraceperiodexpired) reads a log
+line rather than a restart count.
+
 ## Deploy
 
 ```bash

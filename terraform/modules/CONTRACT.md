@@ -12,6 +12,32 @@ That single rule is what keeps `charts/skyl-gateway` free of provider
 conditionals. The moment something upstream writes `if aws`, the abstraction has
 failed and the chart starts accumulating three code paths.
 
+```mermaid
+flowchart TB
+    env["environments/dev/aws<br/>environments/dev/gcp<br/>environments/dev/azure"]
+
+    env -->|"picks one"| impl
+
+    subgraph impl["modules/{aws,gcp,azure} — the only place a cloud is named"]
+        direction LR
+        a["aws"]
+        g["gcp"]
+        z["azure"]
+    end
+
+    impl ==>|"11 outputs, identical<br/>names and types"| boundary{{"THE BOUNDARY<br/>cloud differences stop here"}}
+
+    boundary --> plat["modules/platform"]
+    plat --> chart["charts/skyl-gateway"]
+
+    style boundary stroke-width:3px
+    style impl stroke-dasharray:4 3
+```
+
+Everything below the boundary is written once. The `module "platform"` block in
+all three environments is byte-identical — `diff` them, and only the cluster
+module and its provider wiring differ.
+
 ## Required outputs
 
 ```hcl

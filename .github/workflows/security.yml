@@ -1,0 +1,87 @@
+name: Security
+
+# Static analysis of the infrastructure itself.
+#
+# Findings go to GitHub code scanning as SARIF rather than only to the job log,
+# so they are triageable and a suppression is a recorded decision rather than a
+# scroll past red text.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly. New rules ship constantly and unchanged code can start failing —
+    # which is the point; the risk changed even though the config did not.
+    - cron: "37 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checkov:
+    name: checkov
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf # v12.1347.0
+        with:
+          directory: .
+          framework: terraform,kubernetes,helm,github_actions
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          # Do not fail the build on findings. Checkov's Terraform rules assume
+          # a generic workload and flag several deliberate decisions here — the
+          # public API endpoint, the single NAT gateway, the absent CPU limit —
+          # each of which is argued in a comment at the point it is made.
+          # Findings still land in code scanning, where they can be triaged.
+          soft_fail: true
+
+      - uses: github/codeql-action/upload-sarif@c3400c2f38909e0dcf3c3a41f2030a8217be5d3e # v3
+        if: always()
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+  trivy:
+    name: trivy config
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+
+      - uses: github/codeql-action/upload-sarif@c3400c2f38909e0dcf3c3a41f2030a8217be5d3e # v3
+        if: always()
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+  # Nothing in this repository should contain a credential. The clouds are
+  # reached by OIDC federation and the gateway's secrets live in the cloud
+  # secret stores — so any hit here is either a real leak or a test fixture
+  # that should not look like one.
+  secrets:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

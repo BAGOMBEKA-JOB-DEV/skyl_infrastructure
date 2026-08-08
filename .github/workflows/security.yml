@@ -71,10 +71,9 @@ jobs:
         run: |
           mkdir -p checkov-out
           checkov \
+            --config-file .checkov.yaml \
             --directory . \
             --framework terraform kubernetes helm github_actions \
-            --skip-path '.*/\.terraform/.*' \
-            --skip-path 'policy/fixtures/.*' \
             --output sarif \
             --output-file-path checkov-out \
             --soft-fail

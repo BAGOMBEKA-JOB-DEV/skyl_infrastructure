@@ -1,0 +1,99 @@
+# Checkov configuration.
+#
+# Two IaC scanners run here, Checkov and Trivy, and they overlap almost
+# entirely. Where a decision is already argued at the resource — in a comment
+# and an inline `#trivy:ignore:` — restating it in Checkov's vocabulary as well
+# would mean maintaining the same rationale twice, in two syntaxes, and a
+# reader finding neither authoritative.
+#
+# So the split is: Trivy's suppressions live inline, next to the code, because
+# Trivy is the scanner whose gate must stay green. Checkov's live here, grouped
+# by rationale, because a per-resource comment for 38 rule IDs would bury the
+# code it annotates.
+#
+# Nothing below is skipped for being inconvenient. Each group says what the
+# check wants, and why this repository does something else.
+
+skip-check:
+  # --- provider-managed encryption, deliberately -----------------------------
+  #
+  # Every one of these wants a customer-managed key. State storage and the
+  # secret stores deliberately use provider-managed encryption: a CMK adds a
+  # deletion path that permanently destroys access to the data it protects, and
+  # a scheduled key deletion cannot be undone once the window closes. For
+  # Terraform state and the gateway's provider API keys, that failure mode is
+  # worse than the threat the CMK addresses. Argued at
+  # terraform/bootstrap/aws/main.tf and mirrored in ADR-0003.
+  - CKV_AWS_145   # S3 encrypted with KMS
+  - CKV_AWS_119   # DynamoDB encrypted with KMS CMK
+  - CKV_AWS_149   # Secrets Manager encrypted with KMS CMK
+  - CKV2_AZURE_1  # storage encrypted with CMK
+  - CKV_AZURE_227 # AKS temp disk / cache host-based encryption
+
+  # --- public endpoints, restricted rather than removed ----------------------
+  #
+  # All three clusters expose a public API server narrowed by
+  # var.authorized_networks. Fully private needs a bastion or VPN for every
+  # kubectl and for CI, which is a real operational cost for a workload whose
+  # secrets live in the cloud secret store rather than on the nodes. The same
+  # trade is made identically in all three modules; see ADR-0002.
+  - CKV_AZURE_115 # AKS private cluster
+  - CKV_AZURE_189 # Key Vault public network access
+  - CKV2_AZURE_32 # private endpoint to Key Vault
+  - CKV2_AZURE_33 # private endpoint to storage account
+  #
+  # Key Vault and the state account do deny by default — `network_acls` and
+  # `network_rules` with `bypass = AzureServices`. These checks want a private
+  # endpoint specifically, which is a different and much heavier control.
+
+  # --- checks that are simply wrong for GKE Autopilot ------------------------
+  #
+  # Autopilot manages these and the corresponding Terraform attributes either
+  # do not exist or are rejected. Enabling them is not possible, not declined.
+  - CKV_GCP_12    # NetworkPolicy — Autopilot enables it unconditionally
+  - CKV_GCP_13    # client certificate auth — Autopilot disables it already
+  - CKV_GCP_69    # metadata server — implied by Workload Identity, which is on
+  - CKV_GCP_61    # intranode visibility — Autopilot-managed
+  - CKV_GCP_21    # cluster labels — resource_labels is set; the check misreads Autopilot
+  - CKV_AZURE_232 # critical-addons-only system pool — one node pool by design
+  - CKV_AZURE_168 # minimum node count — node_count is validated >= 2 in variables.tf
+
+  # --- deliberate, argued elsewhere ------------------------------------------
+  - CKV_AZURE_170 # paid SKU for the SLA — sku_tier is Free in dev and Standard in prod, see docs/cost.md
+  - CKV_AZURE_41  # secret expiry — these are placeholders whose real values are set out of band; an expiry would expire the live secret
+  - CKV_AZURE_117 # disk encryption set — needs its own DES and Key Vault key; deferred, see ADR-0004
+  - CKV_AZURE_172 # Secrets Store CSI autorotation — secrets arrive via External Secrets, not the CSI driver, see ADR-0003
+  - CKV2_AWS_57   # Secrets Manager rotation — rotation is manual and documented in the runbook; an automatic rotator would need a Lambda that knows each provider's API
+  - CKV2_AWS_65   # S3 ACLs disabled — BucketOwnerPreferred is required for S3 log delivery to the access-log bucket
+  - CKV_AZURE_59  # storage disallow public access — the account denies by default via network_rules
+  - CKV2_AZURE_40 # shared key authorization — the azurerm backend authenticates with the account key; disabling it breaks `terraform init`
+
+  # --- disproportionate for a single-service deployment ----------------------
+  - CKV_AWS_144   # S3 cross-region replication — state is versioned and recreatable; replication doubles cost for a file that is rebuilt by `terraform apply`
+  - CKV2_AWS_61   # S3 lifecycle on the state bucket — old state versions are the recovery mechanism, not clutter
+  - CKV2_AWS_62   # S3 event notifications — nothing consumes them
+  - CKV2_AZURE_41 # SAS expiration policy — no SAS tokens are issued
+  - CKV2_AZURE_21 # blob read logging — covered by the diagnostic setting, which logs StorageRead/Write/Delete
+  - CKV_AZURE_33  # queue logging — the account serves blobs only
+  - CKV_GCP_62    # bucket access logging — GCS data access logs are enabled at the project audit-config level, not per bucket
+  - CKV2_AZURE_31 # NSG on the AKS subnet — AKS manages its own subnet security rules; a hand-written NSG conflicts with them
+  - CKV2_GCP_18   # explicit firewall — the VPC has no default rules, and egress is governed by the NetworkPolicy in the chart
+  - CKV_GCP_65    # RBAC via Google Groups — needs a Workspace domain this project does not have
+  - CKV_GCP_66    # Binary Authorization — the image is cosign-signed and pinned by digest; enforcing attestations at admission is the logical next step, not yet taken
+
+  # --- acknowledged, not resolved --------------------------------------------
+  #
+  # The community VPC, EKS and IRSA modules are pinned to exact registry
+  # versions (5.16.0, 20.31.6, 5.48.0), not commit hashes. A registry version is
+  # immutable once published, so this is weaker than the SHA pinning used for
+  # every GitHub Action here but not unbounded. Moving to `git::` sources with a
+  # commit hash would give a stronger guarantee at the cost of losing registry
+  # version resolution. Worth revisiting.
+  - CKV_TF_1
+
+# Downloaded modules are not actionable from this repository — fixing their
+# findings means forking upstream. Our configuration OF them is still scanned.
+skip-path:
+  - ".*/\\.terraform/.*"
+  # A deliberately broken manifest. manifests.yml asserts Conftest rejects it.
+  - "policy/fixtures/.*"

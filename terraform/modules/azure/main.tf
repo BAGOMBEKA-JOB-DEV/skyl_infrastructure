@@ -70,6 +70,15 @@ resource "azurerm_kubernetes_cluster" "this" {
   kubernetes_version = var.cluster_version
   sku_tier           = var.sku_tier
 
+  # Patch upgrades applied automatically. Node images too — an unpatched node
+  # image is the most common way a cluster ends up vulnerable while every
+  # dashboard says it is healthy.
+  #
+  # "patch" and not "stable": minor upgrades change API deprecations and should
+  # be a decision, not a Tuesday.
+  automatic_upgrade_channel = "patch"
+  node_os_upgrade_channel   = "NodeImage"
+
   # Workload Identity. Both flags are required and each is useless alone:
   # oidc_issuer_enabled publishes the issuer, workload_identity_enabled installs
   # the mutating webhook that projects the token. Enabling only the first is a

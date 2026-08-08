@@ -101,6 +101,13 @@ resource "aws_s3_bucket_lifecycle_configuration" "logs" {
     expiration {
       days = 90
     }
+
+    # Failed multipart uploads are invisible in the console and billed until
+    # cleaned up. Seven days is long enough for a retry, short enough that the
+    # charge never becomes noticeable.
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
   }
 
   depends_on = [aws_s3_bucket_ownership_controls.logs]

@@ -20,6 +20,18 @@ variable "gateway_hosts" {
   default     = []
 }
 
+variable "authorized_networks" {
+  description = "CIDRs allowed to reach the Kubernetes API. Open by default in dev; narrow it if you can."
+  type        = list(string)
+  default     = []
+}
+
+variable "key_vault_allowed_ips" {
+  description = "Public IPs allowed to reach Key Vault directly. AKS and Terraform already get in via the AzureServices bypass."
+  type        = list(string)
+  default     = []
+}
+
 variable "admin_group_object_ids" {
   description = <<-EOT
     Entra ID groups granted cluster-admin. With local_account_disabled=true on

@@ -94,6 +94,8 @@ resource "google_compute_router_nat" "this" {
 
 # --- cluster -----------------------------------------------------------------
 
+# trivy:ignore:GCP-0061 var.authorized_networks exists and is applied below; it defaults empty so dev is not gated on knowing your egress IP, exactly as the AWS and Azure modules default. Set it per environment.
+# trivy:ignore:GCP-0050 Autopilot owns the node service account; a custom one cannot be set and is not the operator's to manage
 resource "google_container_cluster" "this" {
   name     = local.cluster_name
   location = var.region

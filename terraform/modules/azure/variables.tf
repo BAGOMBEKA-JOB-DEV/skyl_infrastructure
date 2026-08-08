@@ -101,6 +101,32 @@ variable "admin_group_object_ids" {
   default     = []
 }
 
+variable "authorized_networks" {
+  description = <<-EOT
+    CIDRs allowed to reach the Kubernetes API. Empty leaves it open, which is
+    the provider default and is not what you want in prod — the API is still
+    authenticated, but it should not be reachable from everywhere.
+
+    Mirrors the same input on the AWS and GCP modules; the three differ only in
+    how the provider spells it.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
+variable "key_vault_allowed_ips" {
+  description = <<-EOT
+    Public IPs allowed to reach Key Vault directly, on top of the
+    `bypass = AzureServices` rule that lets AKS and Terraform in. Usually empty:
+    the gateway reads secrets through External Secrets, not over the internet.
+
+    Set this only if you need `az keyvault secret set` to work from a laptop
+    outside a trusted network.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
 variable "external_secrets_namespace" {
   description = "Namespace External Secrets Operator runs in."
   type        = string

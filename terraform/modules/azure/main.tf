@@ -58,6 +58,9 @@ resource "azurerm_subnet" "nodes" {
 
 # --- cluster -----------------------------------------------------------------
 
+# trivy:ignore:AZU-0065 public endpoint restricted by authorized_ip_ranges, matching the AWS and GCP modules — see docs/adr/0002
+# trivy:ignore:AZU-0067 a disk encryption set needs its own DES and Key Vault key; deferred, see docs/adr/0004
+# trivy:ignore:AZU-0041 var.authorized_networks exists and is applied below; it defaults empty so dev is not gated on knowing your egress IP, exactly as the AWS and GCP modules default. Set it per environment.
 resource "azurerm_kubernetes_cluster" "this" {
   name                = local.cluster_name
   location            = azurerm_resource_group.this.location
@@ -84,6 +87,30 @@ resource "azurerm_kubernetes_cluster" "this" {
     azure_rbac_enabled     = true
     admin_group_object_ids = var.admin_group_object_ids
   }
+
+  # Restrict who can reach the Kubernetes API.
+  #
+  # This was missing while the AWS and GCP modules both took an
+  # `authorized_networks` input and applied it — an inconsistency, not a
+  # decision, and Trivy AZU-0041 was right to flag it. The three modules now
+  # express the same intent in each provider's own vocabulary, which is exactly
+  # what CONTRACT.md expects a cloud module to absorb.
+  #
+  # An empty list leaves the API open, matching the other two modules' defaults
+  # and the same reasoning: it is still authenticated, and narrowing it is a
+  # per-environment decision.
+  dynamic "api_server_access_profile" {
+    for_each = length(var.authorized_networks) > 0 ? [1] : []
+    content {
+      authorized_ip_ranges = var.authorized_networks
+    }
+  }
+
+  # Azure Policy add-on. Enabled for the same reason Cilium is chosen below: a
+  # policy engine that is installed but not enforcing reports a control that is
+  # not there. Gatekeeper constraints are additive to the chart's own Conftest
+  # rules, which run before anything reaches a cluster.
+  azure_policy_enabled = true
 
   default_node_pool {
     name       = "system"
@@ -154,6 +181,7 @@ resource "azurerm_log_analytics_workspace" "this" {
 
 # --- secret store ------------------------------------------------------------
 
+# trivy:ignore:AZU-0016 purge protection is environment-conditional below, on purpose
 resource "azurerm_key_vault" "this" {
   name                = substr(replace("${local.cluster_name}kv", "-", ""), 0, 24)
   location            = azurerm_resource_group.this.location
@@ -167,9 +195,24 @@ resource "azurerm_key_vault" "this" {
 
   # Recovery. Purge protection cannot be disabled once enabled, and a vault
   # name stays reserved for the retention period — which makes an accidental
-  # enable in dev genuinely painful. Hence the environment split.
+  # enable in dev genuinely painful. Hence the environment split, and hence the
+  # AZU-0016 ignore above: prod does enable it.
   purge_protection_enabled   = var.environment == "prod"
   soft_delete_retention_days = var.environment == "prod" ? 90 : 7
+
+  # Deny by default. The vault holds every provider API key, so it should not
+  # be reachable from the internet at large.
+  #
+  # `bypass = AzureServices` is load-bearing, not a loophole: without it the
+  # AKS-hosted External Secrets Operator cannot reach the vault, and neither
+  # can the principal running Terraform when it creates the secret containers
+  # below. Removing it produces a 403 at apply time that reads like an IAM
+  # problem.
+  network_acls {
+    default_action = "Deny"
+    bypass         = "AzureServices"
+    ip_rules       = var.key_vault_allowed_ips
+  }
 
   tags = local.tags
 }
@@ -211,13 +254,19 @@ resource "azurerm_role_assignment" "external_secrets" {
 #   az keyvault secret set --vault-name <vault> \
 #     --name skyl-gateway-auth-token --value "$TOKEN"
 
+# trivy:ignore:AZU-0017 an expiry here would expire the operator's real value, not the placeholder
 resource "azurerm_key_vault_secret" "gateway" {
   for_each = toset(var.secret_names)
 
   name         = each.value
   value        = "placeholder-replace-me"
   key_vault_id = azurerm_key_vault.this.id
-  tags         = local.tags
+
+  # Content type, so `az keyvault secret list` is readable and tooling can tell
+  # these apart from certificates or connection strings.
+  content_type = "text/plain; charset=utf-8"
+
+  tags = local.tags
 
   lifecycle {
     # Terraform created the container; the operator owns the value. Without

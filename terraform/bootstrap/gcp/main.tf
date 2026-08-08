@@ -18,6 +18,7 @@ provider "google" {
   region  = var.region
 }
 
+# trivy:ignore:GCP-0066 Google-managed encryption is deliberate; a CMEK adds a key whose deletion locks you out of your own state
 resource "google_storage_bucket" "state" {
   # Bucket names are globally unique, so the project ID is part of it.
   name     = "${var.project_id}-skyl-tfstate"

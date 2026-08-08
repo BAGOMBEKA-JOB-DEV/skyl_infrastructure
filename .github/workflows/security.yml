@@ -28,23 +28,48 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf # v12.1347.0
+      # Run from pip rather than bridgecrewio/checkov-action.
+      #
+      # The action was pinned by SHA, as everything here is, and that pin turned
+      # out to run `docker://bridgecrew/checkov:2.0.930` — a 2021 image — while
+      # carrying a v12 tag. It also rejects `output_file_path`, so no SARIF was
+      # written and the upload step failed on a missing file. Pinning the tool
+      # instead of the wrapper makes the version visible and the output path
+      # ours to choose.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          directory: .
-          framework: terraform,kubernetes,helm,github_actions
-          output_format: cli,sarif
-          output_file_path: console,checkov.sarif
-          # Do not fail the build on findings. Checkov's Terraform rules assume
-          # a generic workload and flag several deliberate decisions here — the
-          # public API endpoint, the single NAT gateway, the absent CPU limit —
-          # each of which is argued in a comment at the point it is made.
-          # Findings still land in code scanning, where they can be triaged.
-          soft_fail: true
+          python-version: "3.12"
+
+      - name: install checkov
+        run: pip install --disable-pip-version-check "checkov==${CHECKOV_VERSION}"
+        env:
+          CHECKOV_VERSION: "3.3.9"
+
+      # --soft-fail: findings must not fail the build. Checkov's rules assume a
+      # generic workload and flag several deliberate decisions here — the public
+      # API endpoint, the single NAT gateway, the absent CPU limit — each argued
+      # in a comment where it is made. They still reach code scanning, which is
+      # where a suppression can be recorded as a decision rather than a silence.
+      #
+      # The directory is scanned with .external_modules skipped: the AWS module
+      # pulls in the community VPC and EKS modules, and their findings are not
+      # actionable from this repository.
+      - name: checkov
+        run: |
+          checkov \
+            --directory . \
+            --framework terraform kubernetes helm github_actions \
+            --skip-path '.*/\.terraform/.*' \
+            --output cli --output sarif \
+            --output-file-path console,. \
+            --soft-fail
 
       - uses: github/codeql-action/upload-sarif@c3400c2f38909e0dcf3c3a41f2030a8217be5d3e # v3
         if: always()
         with:
-          sarif_file: checkov.sarif
+          # `--output-file-path console,.` writes results.sarif into the
+          # directory given after the comma.
+          sarif_file: results.sarif
           category: checkov
 
   trivy:
@@ -63,7 +88,23 @@ jobs:
           format: sarif
           output: trivy.sarif
           severity: CRITICAL,HIGH
+          # Findings go to code scanning, not to a build failure. Note this
+          # does NOT stop the "Trivy" code-scanning check from going red: that
+          # gate fires on new alerts regardless of this step's exit code, which
+          # is why every remaining finding carries an inline `#trivy:ignore:`
+          # with a justification rather than being left to accumulate.
           exit-code: "0"
+          # Downloaded community modules. A fresh CI checkout has no
+          # .terraform/, so this changes nothing here — it exists so a local
+          # run after `terraform init` reports the same findings CI does,
+          # instead of ~60 extra hits from the EKS module's example manifests.
+          skip-dirs: "**/.terraform"
+          # policy/fixtures/violations.yaml is a deliberately broken manifest.
+          # Conftest is asserted to REJECT it in manifests.yml; Trivy flagging
+          # its 16 planted defects is correct and entirely uninteresting, and
+          # leaving it in would bury real findings under known ones.
+          skip-files: "policy/fixtures/violations.yaml"
+          trivy-config: trivy.yaml
 
       - uses: github/codeql-action/upload-sarif@c3400c2f38909e0dcf3c3a41f2030a8217be5d3e # v3
         if: always()

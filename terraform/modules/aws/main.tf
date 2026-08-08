@@ -208,6 +208,7 @@ module "external_secrets_irsa" {
 #   aws secretsmanager put-secret-value \
 #     --secret-id skyl-gateway-auth-token --secret-string "$TOKEN"
 
+# trivy:ignore:AWS-0098 the AWS-managed key is sufficient here; a CMK adds a deletion path that would make the provider keys unrecoverable, and access is already scoped to skyl-* by the IRSA policy above
 resource "aws_secretsmanager_secret" "gateway" {
   for_each = toset(var.secret_names)
 

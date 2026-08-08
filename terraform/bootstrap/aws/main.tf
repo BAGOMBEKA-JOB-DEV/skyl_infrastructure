@@ -33,6 +33,87 @@ resource "aws_s3_bucket" "state" {
   }
 }
 
+# Access logs for the state bucket: who read and wrote state, and when.
+#
+# A separate bucket, because a bucket cannot log to itself — S3 rejects the
+# configuration, and if it did not, every write would log a write.
+#
+# trivy:ignore:AWS-0089 the log bucket does not log its own access; that is the recursion above
+# trivy:ignore:AWS-0132 SSE-S3 rather than a CMK, for the reason given on the state bucket below
+resource "aws_s3_bucket" "logs" {
+  bucket = "${local.bucket_name}-logs"
+
+  tags = {
+    ManagedBy = "terraform"
+    PartOf    = "skyl"
+    Purpose   = "tfstate-access-logs"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# trivy:ignore:AWS-0132 SSE-S3, for the same reason as the state bucket: a CMK adds a deletion path that permanently destroys access to the data it protects
+resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# Versioned like the state bucket. Access logs are audit evidence, and audit
+# evidence that can be silently overwritten is not evidence.
+resource "aws_s3_bucket_versioning" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# S3 log delivery writes with the log-delivery-write canned ACL, which requires
+# ACLs to be enabled on the destination. Buckets created today default to
+# BucketOwnerEnforced, which disables ACLs entirely and makes log delivery fail
+# silently — no error, just no logs.
+resource "aws_s3_bucket_ownership_controls" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  rule {
+    id     = "expire"
+    status = "Enabled"
+
+    filter {}
+
+    expiration {
+      days = 90
+    }
+  }
+
+  depends_on = [aws_s3_bucket_ownership_controls.logs]
+}
+
+resource "aws_s3_bucket_logging" "state" {
+  bucket        = aws_s3_bucket.state.id
+  target_bucket = aws_s3_bucket.logs.id
+  target_prefix = "tfstate-access/"
+
+  depends_on = [aws_s3_bucket_ownership_controls.logs]
+}
+
 resource "aws_s3_bucket_versioning" "state" {
   bucket = aws_s3_bucket.state.id
   versioning_configuration {
@@ -40,13 +121,15 @@ resource "aws_s3_bucket_versioning" "state" {
   }
 }
 
+# trivy:ignore:AWS-0132 SSE-S3 chosen deliberately; rationale in the comment below
 resource "aws_s3_bucket_server_side_encryption_configuration" "state" {
   bucket = aws_s3_bucket.state.id
   rule {
     apply_server_side_encryption_by_default {
       # SSE-S3 rather than KMS. State is already access-controlled, and a KMS
       # key adds a per-request charge plus one more thing whose deletion locks
-      # you out of your own state.
+      # you out of your own state — permanently, since a scheduled key deletion
+      # cannot be undone after the window closes.
       sse_algorithm = "AES256"
     }
   }
@@ -89,6 +172,7 @@ resource "aws_s3_bucket_policy" "state" {
 # replace this. The table is kept because it works on every Terraform version
 # and costs pennies on-demand — a locking mechanism is the wrong place to be
 # on the leading edge.
+# trivy:ignore:AWS-0025 AWS-owned key is sufficient: the table holds lock IDs and timestamps, no state contents
 resource "aws_dynamodb_table" "lock" {
   name         = "skyl-tfstate-lock"
   billing_mode = "PAY_PER_REQUEST"

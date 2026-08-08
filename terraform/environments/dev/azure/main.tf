@@ -37,6 +37,8 @@ module "cluster" {
   sku_tier = "Free"
 
   admin_group_object_ids = var.admin_group_object_ids
+  authorized_networks    = var.authorized_networks
+  key_vault_allowed_ips  = var.key_vault_allowed_ips
 }
 
 # local_account_disabled is true on the cluster, so kube_admin_config is empty.

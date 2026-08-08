@@ -9,6 +9,46 @@ The gateway is one authenticated endpoint that fans out to Anthropic, OpenAI,
 Gemini and any OpenAI-compatible provider. It holds the API keys so your
 services do not have to.
 
+## What this builds
+
+```mermaid
+flowchart TB
+    users(["your services<br/>bearer token only"])
+
+    subgraph cloud["one cluster — AWS, GCP or Azure"]
+        lb(["cloud load balancer"])
+        ing["ingress-nginx<br/>SSE timeouts, TLS via cert-manager"]
+
+        subgraph ns["namespace: skyl"]
+            pods["skyl-gateway<br/>2+ replicas · distroless · nonroot<br/>PDB · zone spread · HPA"]
+            sec["Secret<br/>SKYL_AUTH_TOKEN + provider keys"]
+        end
+
+        eso["External Secrets Operator"]
+        prom["Prometheus + Grafana<br/>ServiceMonitor · PrometheusRule"]
+    end
+
+    store[("cloud secret store<br/>Secrets Manager / Secret Manager / Key Vault")]
+    providers(["provider APIs<br/>443 only, egress-restricted"])
+
+    users --> lb --> ing --> pods
+    eso -->|"workload identity —<br/>no static credential"| store
+    eso -->|writes| sec
+    sec -.->|"env at startup"| pods
+    prom -.->|scrapes /metrics| pods
+    pods -->|"HTTPS"| providers
+
+    style ns stroke-dasharray:4 3
+```
+
+Two things that diagram is trying to make obvious. Provider credentials never
+pass through git or Terraform state — they go from the cloud's own secret store
+into the pod, and External Secrets reaches that store with a workload identity
+rather than a stored key. And egress is restricted to 443 with the cloud
+metadata endpoint blocked, because a pod holding those keys is the ideal place
+to exfiltrate them from
+([ADR-0004](docs/adr/0004-egress-restriction.md)).
+
 ## What is here
 
 ```
@@ -27,6 +67,36 @@ Every cloud module emits the **same eleven outputs** —
 [`terraform/modules/CONTRACT.md`](terraform/modules/CONTRACT.md). Everything
 above them consumes only those, so `modules/platform` and
 `charts/skyl-gateway` contain no provider conditionals at all.
+
+```mermaid
+flowchart TB
+    subgraph clouds["three implementations — each knows one cloud"]
+        aws["modules/aws<br/>EKS · IRSA · Secrets Manager"]
+        gcp["modules/gcp<br/>GKE Autopilot · Workload Identity"]
+        az["modules/azure<br/>AKS · Entra federation · Key Vault"]
+    end
+
+    contract{{"the contract — 11 outputs<br/>cluster_endpoint · oidc_issuer_url<br/>workload_identity_annotation<br/>secret_store_backend · ingress_class · …"}}
+
+    aws --> contract
+    gcp --> contract
+    az --> contract
+
+    contract --> platform["modules/platform<br/>ESO · ingress-nginx · cert-manager · Prometheus<br/><b>written once, names no cloud</b>"]
+    platform --> chart["charts/skyl-gateway<br/><b>written once, no provider conditionals</b>"]
+
+    style contract stroke-width:3px
+    style clouds stroke-dasharray:4 3
+```
+
+Everything below the thick line is written once. Adding a fourth cloud means
+writing one module against the contract and changing nothing above it.
+
+Both halves of that claim are enforced mechanically rather than by review: CI
+greps each cloud module for all eleven output names, and fails if
+`modules/platform` mentions a cloud anywhere outside the single sanctioned
+exception. `terraform validate` would not catch either — a dropped output only
+surfaces at the first environment that consumes it.
 
 The `module "platform"` block is byte-identical in all three environments. Diff
 them:
@@ -47,6 +117,39 @@ Cross-cloud primitives:
 | Identity | IRSA / Workload Identity / Entra federation | No static cloud credentials anywhere, including CI |
 | Ingress | ingress-nginx + cert-manager | Behaves the same on all three. See [ADR-0002](docs/adr/0002-ingress-nginx-over-gateway-api.md) |
 | Observability | kube-prometheus-stack | skyl already exports OpenTelemetry GenAI metrics |
+
+## Where the image comes from
+
+The chart refuses to deploy a mutable tag, which makes the path from source to
+running pod worth drawing:
+
+```mermaid
+flowchart LR
+    tag(["git tag gateway/v*<br/>in the skyl repo"]) --> build["build<br/>linux/amd64 + linux/arm64"]
+    build --> push["push to GHCR"]
+    push --> sign["cosign sign<br/>keyless, OIDC identity"]
+    sign --> sbom["SBOM + provenance<br/>attestation"]
+    sbom --> digest{{"sha256:… the digest"}}
+
+    digest --> tf["terraform apply<br/>-var gateway_image_digest=…"]
+    tf --> helm["Helm renders<br/>image: repo@sha256:…"]
+    helm --> pod(["running pod"])
+
+    verify(["cosign verify"]) -.-> digest
+
+    style digest stroke-width:3px
+```
+
+A tag is a mutable pointer: the same `helm upgrade` run twice can deploy
+different bytes, which makes a rollback a guess and means the signature covers
+something nobody recorded. Pinning the digest is what makes "roll back to what
+was running yesterday" a fact rather than a hope — and the chart `fail`s at
+render time rather than deploying a tag.
+
+**No image has been published yet.** skyl's `publish-image.yml` postdates the
+existing `gateway/v0.1.0` tag, so it has not had a tag push to run on — trigger
+it from the Actions tab or on the next release. Until then, build locally and
+load the image into your cluster.
 
 ## Getting started
 
@@ -110,7 +213,20 @@ come from skyl's own runbook, verified against a running binary.
 - **The grace-expiry warning exits 0.** A pod that force-closed streams logs a
   WARN and exits cleanly, so restart-count alerting will never see it.
 
+## The three repositories
+
+| Repository | What it is |
+|---|---|
+| [skyl](https://github.com/BAGOMBEKA-JOB-DEV/skyl) | The Go library, the adapters, and the gateway this deploys |
+| [skyl_docs](https://github.com/BAGOMBEKA-JOB-DEV/skyl_docs) | The [documentation site](https://skyl-docs.vercel.app/) (Next.js) |
+| **[skyl_infrastructure](https://github.com/BAGOMBEKA-JOB-DEV/skyl_infrastructure)** | This one — Terraform for three clouds, the Helm chart, CI |
+
+The probe semantics, the 32-second drain and the exit-code behaviour encoded in
+this chart are all documented at source in
+[skyl's gateway runbook](https://github.com/BAGOMBEKA-JOB-DEV/skyl/blob/main/docs/gateway.md#runbook).
+When the two disagree, that one is right and this is the bug.
+
 ## Contributing
 
-Commits need a `Signed-off-by` line (`git commit -s`); CI enforces it.
-Apache-2.0, matching skyl.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Commits need a `Signed-off-by` line
+(`git commit -s`); CI enforces it. Apache-2.0, matching skyl.

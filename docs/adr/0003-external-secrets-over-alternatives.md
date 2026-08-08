@@ -45,6 +45,32 @@ Values are set out of band:
 echo -n "$TOKEN" | gcloud secrets versions add skyl-gateway-auth-token --data-file=-
 ```
 
+The resulting path, with the two places a secret is deliberately *absent*
+marked:
+
+```mermaid
+flowchart LR
+    op(["operator<br/>gcloud / aws / az CLI"]) -->|"sets the value"| store[("cloud secret store")]
+
+    tf["Terraform"] -->|"creates the empty<br/>container only"| store
+    git[("git")] -.->|"never"| store
+
+    store -->|"read"| eso["External Secrets Operator"]
+    wi{{"workload identity<br/>IRSA · GKE WI · Entra federation"}} -.->|"authenticates<br/>no stored key"| eso
+
+    eso -->|"materialises"| k8s["Kubernetes Secret"]
+    k8s -->|"envFrom at pod start"| pod(["gateway"])
+
+    style git stroke-dasharray:5 4
+    style tf stroke-dasharray:5 4
+```
+
+The two dashed edges are the argument. Terraform touches the container but never
+the value, because a value passed to a resource is written to state in
+plaintext — and state is the one file that gets copied to laptops, attached to
+tickets, and restored from backups. Git never sees it at all, which is what
+rules out the sealed-secrets and SOPS options above.
+
 Azure is the awkward case: `azurerm_key_vault_secret` requires a value, so a
 placeholder is written with `lifecycle { ignore_changes = [value] }`. Without
 that, every plan after the real secret is set shows a diff reverting it — and

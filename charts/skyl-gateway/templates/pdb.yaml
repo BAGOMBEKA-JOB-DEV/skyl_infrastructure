@@ -1,0 +1,19 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# Keeps a voluntary disruption — node drain, cluster upgrade, autoscaler
+# compaction — from taking every replica at once.
+#
+# minAvailable rather than maxUnavailable: with an HPA the replica count moves,
+# and a percentage-based maxUnavailable computed against a scaled-down fleet can
+# evaluate to "all of them".
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "skyl-gateway.fullname" . }}
+  labels:
+    {{- include "skyl-gateway.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "skyl-gateway.selectorLabels" . | nindent 6 }}
+{{- end }}

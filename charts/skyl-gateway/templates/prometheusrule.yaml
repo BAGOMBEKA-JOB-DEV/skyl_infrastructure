@@ -1,0 +1,143 @@
+{{- if .Values.prometheusRule.enabled }}
+{{- $fullName := include "skyl-gateway.fullname" . }}
+# Alerts, derived from skyl's own runbook rather than from generic templates.
+#
+# Every metric name here was taken from a running exporter, not from the OTel
+# spec: the gateway registers exactly two instruments,
+# `gen_ai.client.token.usage` and `gen_ai.client.operation.duration`, which the
+# Prometheus exporter renders as `gen_ai_client_token_usage_*` and
+# `gen_ai_client_operation_duration_seconds_*`. Note the absence of a `_total`
+# suffix on the histograms, and that token usage carries no unit suffix.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "skyl-gateway.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: skyl-gateway.availability
+      rules:
+        - alert: SkylGatewayAbsent
+          # `absent` rather than a threshold on replica count: if every pod is
+          # gone the metric is not zero, it is missing, and a threshold rule
+          # would silently never fire.
+          expr: absent(up{job=~".*{{ $fullName }}.*"} == 1)
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "skyl-gateway is not being scraped"
+            description: >-
+              No skyl-gateway instance has reported for 5 minutes. Either every
+              replica is down or the ServiceMonitor selector no longer matches.
+            runbook_url: https://github.com/BAGOMBEKA-JOB-DEV/skyl_infrastructure/blob/main/docs/runbook.md#skylgatewayabsent
+
+        - alert: SkylGatewayNotReady
+          # Readiness flapping is expected briefly on every rollout — the
+          # gateway returns 503 from /readyz for ~2s while draining. 10m of it
+          # is not a rollout.
+          expr: |
+            kube_deployment_status_replicas_ready{deployment="{{ $fullName }}"}
+              < kube_deployment_spec_replicas{deployment="{{ $fullName }}"}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "skyl-gateway has unready replicas"
+            description: >-
+              Ready replicas have been below desired for 10 minutes. A rollout
+              takes well under this; suspect a missing provider key, since
+              starting with none is a fatal error and produces CrashLoopBackOff.
+            runbook_url: https://github.com/BAGOMBEKA-JOB-DEV/skyl_infrastructure/blob/main/docs/runbook.md#skylgatewaynotready
+
+        - alert: SkylGatewayCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total{container="gateway"}[15m]) > 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "skyl-gateway is restarting repeatedly"
+            description: >-
+              Exit 1 is the gateway's only non-zero code and means startup
+              validation failed or the listener could not bind. Check the logs
+              for the named environment variable — a malformed value is always
+              reported before exit.
+            runbook_url: https://github.com/BAGOMBEKA-JOB-DEV/skyl_infrastructure/blob/main/docs/runbook.md#skylgatewaycrashlooping
+
+    - name: skyl-gateway.latency
+      rules:
+        - alert: SkylGatewayHighLatency
+          # p95 over 30s. Deliberately generous: these are model calls, and a
+          # long generation legitimately takes tens of seconds. This catches a
+          # provider degrading, not a slow prompt.
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le, gen_ai_provider_name) (
+                rate(gen_ai_client_operation_duration_seconds_bucket[10m])
+              )
+            ) > 30
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "p95 latency above 30s for {{ "{{ $labels.gen_ai_provider_name }}" }}"
+            description: >-
+              One provider is degrading. The gateway does not fail readiness on
+              provider health, by design — there is nothing to fail over to and
+              flapping readiness would drain the fleet. Consider shifting
+              traffic with SKYL_DEFAULT_PROVIDER.
+            runbook_url: https://github.com/BAGOMBEKA-JOB-DEV/skyl_infrastructure/blob/main/docs/runbook.md#skylgatewayhighlatency
+
+        - alert: SkylGatewaySaturated
+          # Little's Law: durations accruing per second is the mean number of
+          # requests in flight. Compared against SKYL_MAX_CONCURRENT, above
+          # which the gateway starts shedding.
+          expr: |
+            sum by (pod) (rate(gen_ai_client_operation_duration_seconds_sum[5m]))
+              > {{ mul .Values.config.maxConcurrent 80 | div 100 }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "skyl-gateway approaching SKYL_MAX_CONCURRENT"
+            description: >-
+              In-flight requests are above 80% of the configured limit of
+              {{ .Values.config.maxConcurrent }}. Past it the gateway rejects
+              work. Raise autoscaling.maxReplicas or config.maxConcurrent.
+            runbook_url: https://github.com/BAGOMBEKA-JOB-DEV/skyl_infrastructure/blob/main/docs/runbook.md#skylgatewaysaturated
+
+    - name: skyl-gateway.shutdown
+      rules:
+        # The runbook's central warning, made operable.
+        #
+        # A stream still generating when the 30s grace expires is force-closed,
+        # the client sees a truncated SSE stream with no terminal event, and the
+        # upstream call was already paid for. The process logs a WARN and still
+        # exits 0 — so this is invisible to exit-code and restart-count alerting,
+        # which is exactly why it needs its own rule.
+        #
+        # Requires log-derived metrics (Loki ruler, or a log exporter mapping
+        # the WARN to a counter). Without one, this rule is inert rather than
+        # wrong: no series, no alert. docs/runbook.md gives the Loki expression.
+        - alert: SkylGatewayGracePeriodExpired
+          expr: |
+            increase(skyl_gateway_grace_period_expired_total[1h]) > {{ .Values.prometheusRule.gracePeriodExpiryThreshold }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "streams were force-closed at shutdown"
+            description: >-
+              A pod hit its 30s shutdown grace with requests still in flight and
+              closed anyway. Clients saw truncated streams. If this recurs on
+              every rollout, terminationGracePeriodSeconds
+              ({{ .Values.terminationGracePeriodSeconds }}) is too tight for the
+              generation lengths in use.
+            runbook_url: https://github.com/BAGOMBEKA-JOB-DEV/skyl_infrastructure/blob/main/docs/runbook.md#skylgatewaygraceperiodexpired
+{{- end }}

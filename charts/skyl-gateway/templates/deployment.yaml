@@ -1,0 +1,171 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "skyl-gateway.fullname" . }}
+  labels:
+    {{- include "skyl-gateway.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "skyl-gateway.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never go below the desired count during a rollout. The gateway holds
+      # long-lived SSE streams, so an old pod can legitimately take 30s to
+      # retire; surging first means capacity is available the whole time.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "skyl-gateway.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Roll the pods when configuration changes. Without this a ConfigMap
+        # edit updates the object and nothing restarts, so the change appears
+        # applied while every running pod still holds the old value.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "skyl-gateway.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+
+      # Worst case is ~32s: a 2s drain delay so the load balancer observes
+      # /readyz going 503, then up to 30s of shutdown grace for in-flight
+      # streams. Anything below 40 SIGKILLs the process mid-drain and truncates
+      # live responses that the upstream provider has already been billed for.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+
+      securityContext:
+        runAsNonRoot: true
+        # 65532 is distroless' `nonroot`. Stated explicitly so the pod is
+        # rejected at admission rather than at container start if the base
+        # image ever changes underneath us.
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: gateway
+          image: {{ include "skyl-gateway.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: [ALL]
+
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+
+          env:
+            {{- include "skyl-gateway.configEnv" . | nindent 12 }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+          # Secrets arrive as an envFrom rather than individual valueFrom
+          # entries: the set of provider keys varies per environment, and the
+          # gateway registers a provider for each key it finds. Enumerating
+          # them here would mean editing the chart to add a provider.
+          envFrom:
+            - secretRef:
+                name: {{ include "skyl-gateway.secretName" . }}
+
+          # The image has no shell, so every probe must be httpGet. An exec
+          # probe fails with "no such file or directory" and looks like a crash.
+          #
+          # /healthz — is the process alive? Stays 200 throughout the drain, on
+          # purpose. Wiring liveness to /readyz would have the kubelet restart
+          # the pod during every graceful shutdown.
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+
+          # /readyz — should traffic come here? 503 the instant draining starts.
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+
+          # Config is validated before the listener binds, so a pod that is
+          # slow to start has a bad value rather than a cold cache. The startup
+          # probe holds liveness off until then; without it, a validation stall
+          # would trip the liveness probe and mask the real error in a restart
+          # loop.
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path }}
+              port: http
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          # readOnlyRootFilesystem is set above, and Go writes temporary files
+          # under TMPDIR for multipart parsing. An emptyDir keeps that working
+          # without making the image's own filesystem writable.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+
+      {{- if .Values.topologySpreadConstraints.enabled }}
+      # ScheduleAnyway, not DoNotSchedule: a single-zone dev cluster would
+      # otherwise leave the second replica Pending forever with no obvious
+      # cause.
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.topologySpreadConstraints.maxSkew }}
+          topologyKey: {{ .Values.topologySpreadConstraints.topologyKey }}
+          whenUnsatisfiable: {{ .Values.topologySpreadConstraints.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "skyl-gateway.selectorLabels" . | nindent 14 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

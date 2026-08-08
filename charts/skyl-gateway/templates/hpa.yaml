@@ -1,0 +1,68 @@
+{{- if .Values.autoscaling.enabled }}
+{{- $a := .Values.autoscaling }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "skyl-gateway.fullname" . }}
+  labels:
+    {{- include "skyl-gateway.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "skyl-gateway.fullname" . }}
+  minReplicas: {{ $a.minReplicas }}
+  maxReplicas: {{ $a.maxReplicas }}
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $a.targetCPUUtilizationPercentage }}
+    {{- if gt (int $a.targetConcurrency) 0 }}
+    {{- if ge (int $a.targetConcurrency) (int $.Values.config.maxConcurrent) }}
+    {{- fail (printf "autoscaling.targetConcurrency (%v) must be below config.maxConcurrent (%v), or pods shed load before the autoscaler reacts" $a.targetConcurrency $.Values.config.maxConcurrent) }}
+    {{- end }}
+    # CPU alone is a poor signal here: the gateway spends nearly all of a
+    # request waiting on a provider, so a pod can sit at SKYL_MAX_CONCURRENT
+    # while barely registering on CPU.
+    #
+    # The gateway exports no in-flight gauge — its only instruments are the two
+    # OpenTelemetry GenAI histograms. Average concurrency is recovered from the
+    # duration histogram by Little's Law: the sum of request durations accruing
+    # per second *is* the mean number in flight.
+    #
+    #   sum by (pod) (rate(gen_ai_client_operation_duration_seconds_sum[1m]))
+    #
+    # This is not available to the HPA out of the box. It requires
+    # prometheus-adapter with the rule in docs/observability.md exposing it as
+    # `skyl_gateway_inflight`; without that adapter the HPA reports
+    # FailedGetPodsMetric and stops scaling on CPU too. Hence default 0.
+    - type: Pods
+      pods:
+        metric:
+          name: skyl_gateway_inflight
+        target:
+          type: AverageValue
+          averageValue: {{ $a.targetConcurrency | quote }}
+    {{- end }}
+
+  behavior:
+    scaleUp:
+      # React quickly: a provider slowdown backs requests up fast.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      # Slowly. Every removed pod may hold streams for up to 32s, and flapping
+      # replicas during a traffic dip costs more than the pods saved.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+{{- end }}

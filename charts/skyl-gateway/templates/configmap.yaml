@@ -1,0 +1,18 @@
+# Rendered config, for humans and for the rollout checksum.
+#
+# The gateway reads none of this: its configuration is environment variables set
+# directly on the container. This ConfigMap exists so that `kubectl get cm` shows
+# what a running deployment was configured with, and so deployment.yaml can
+# checksum it and roll the pods when it changes.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "skyl-gateway.fullname" . }}
+  labels:
+    {{- include "skyl-gateway.labels" . | nindent 4 }}
+data:
+  # Secrets are deliberately absent — SKYL_AUTH_TOKEN and the provider keys
+  # come from the Secret, and a ConfigMap is world-readable to anyone with get
+  # on the namespace.
+  config.yaml: |
+    {{- toYaml .Values.config | nindent 4 }}

@@ -1,0 +1,43 @@
+# Terraform state is never committed. It contains resource attributes that are
+# secrets in practice — connection strings, generated passwords, certificate
+# private keys — regardless of how carefully the configuration avoids them.
+# State lives in the remote backends stood up by terraform/bootstrap/.
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+
+# Provider plugins and module caches. Reproduced by `terraform init`.
+.terraform/
+.terraform.lock.hcl.bak
+
+# Plan files are not configuration; they are a point-in-time diff, and they
+# embed the values of everything they touch. CI passes them between jobs as an
+# artefact with a short retention, never through git.
+*.tfplan
+*.tfplan.*
+plan.out
+plan.json
+
+# Variable files hold environment-specific values including account IDs and
+# subscription IDs. environments/*/terraform.tfvars.example is committed as the
+# template; the real one is not.
+*.auto.tfvars
+terraform.tfvars
+!terraform.tfvars.example
+
+# Helm
+charts/**/charts/
+*.tgz
+
+# Kubeconfigs written by `terraform output` or the cloud CLIs. These are
+# credentials.
+kubeconfig
+kubeconfig-*
+*.kubeconfig
+
+# Local tooling
+.tool-versions.local
+bin/
+.DS_Store

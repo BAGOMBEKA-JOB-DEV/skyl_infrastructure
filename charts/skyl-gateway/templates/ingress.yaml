@@ -1,0 +1,50 @@
+{{- if .Values.ingress.enabled }}
+{{- $fullName := include "skyl-gateway.fullname" . }}
+{{- $port := .Values.service.port }}
+{{- $ing := .Values.ingress }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "skyl-gateway.labels" . | nindent 4 }}
+  annotations:
+    # /v1/chat/stream is Server-Sent Events. Three defaults break it, and each
+    # one presents as "the stream just stops" rather than as an error:
+    #
+    #   proxy-read-timeout   60s by default; a long generation exceeds it
+    #   proxy-buffering      buffers the whole response, so nothing streams
+    #   proxy-http-version   1.0 cannot chunk
+    nginx.ingress.kubernetes.io/proxy-read-timeout: {{ $ing.streamingTimeoutSeconds | quote }}
+    nginx.ingress.kubernetes.io/proxy-send-timeout: {{ $ing.streamingTimeoutSeconds | quote }}
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+
+    # Request bodies carry conversation history and can be large, but not
+    # unbounded — an unlimited body is a cheap way to exhaust the pod.
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    {{- with $ing.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ $ing.className }}
+  {{- with $ing.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range $ing.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ default "Prefix" .pathType }}
+            backend:
+              service:
+                name: {{ $fullName }}
+                port:
+                  number: {{ $port }}
+          {{- end }}
+    {{- end }}
+{{- end }}

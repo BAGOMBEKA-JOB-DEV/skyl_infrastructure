@@ -1,0 +1,240 @@
+# Defaults are the production-safe answer. An environment overlay narrows or
+# scales them; nothing here has to be overridden to get a correct deployment.
+#
+# Values that would be unsafe to guess have no default and fail rendering with
+# a named error rather than deploying something subtly wrong.
+
+image:
+  repository: ghcr.io/bagombeka-job-dev/skyl-gateway
+
+  # Pinned by digest, never by tag. A tag is a mutable pointer: the same
+  # `helm upgrade` run twice can deploy different bytes, which makes a rollback
+  # a guess. The digest is printed by skyl's publish-image workflow.
+  #
+  # Required — rendering fails without it. See templates/_helpers.tpl.
+  digest: ""
+
+  # Only consulted when digest is empty AND allowMutableTag is true. That
+  # combination exists for local kind testing and is rejected by policy in CI.
+  tag: ""
+  allowMutableTag: false
+
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Two, not one. A single replica means every rollout and every node drain is an
+# outage, and the PodDisruptionBudget below cannot protect a single pod.
+replicaCount: 2
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  # The gateway calls no cloud API — External Secrets does that with its own
+  # identity — so it needs no projected token. Set true only if you add a code
+  # path that federates with a cloud SDK directly; see serviceaccount.yaml.
+  automountToken: false
+  # Workload identity annotation. Terraform emits this per cloud
+  # (eks.amazonaws.com/role-arn, iam.gke.io/gcp-service-account,
+  # azure.workload.identity/client-id) and the environment passes it straight
+  # through, so the chart itself never branches on provider.
+  annotations: {}
+  labels: {}
+
+# --- gateway configuration ---------------------------------------------------
+#
+# Everything the gateway reads is an environment variable; there are no flags
+# and no config file. A malformed value is a startup failure, not a warning, so
+# these are validated at render time where possible.
+config:
+  addr: ":8080"
+
+  # Prometheus /metrics. Kept on the same listener as the API, which is why the
+  # NetworkPolicy below restricts who may reach it rather than relying on a
+  # separate port.
+  metrics: true
+
+  # Empty disables CORS, which is correct for a server holding provider API
+  # keys. Set only if a browser origin genuinely needs direct access.
+  allowedOrigins: []
+
+  defaultProvider: ""
+
+  # Bounds in-flight requests. The HPA target must sit below this or pods
+  # saturate and shed load before the autoscaler ever reacts — see hpa.yaml.
+  maxConcurrent: 64
+
+  requestTimeout: ""
+  attemptTimeout: ""
+  maxRetries: ""
+  retryBaseDelay: ""
+  retryMaxDelay: ""
+  retryAfterCap: ""
+  heartbeatInterval: ""
+
+  # Echoes the upstream provider's raw response. Off: it inflates responses and
+  # can carry provider-side content that has not been through skyl's redaction.
+  includeRaw: false
+
+# --- secrets -----------------------------------------------------------------
+#
+# The gateway needs SKYL_AUTH_TOKEN and at least one provider key. Starting
+# with no provider key is a fatal error, so a missing secret is CrashLoopBackOff
+# rather than a degraded service.
+secrets:
+  # External Secrets Operator syncs from the cloud's own secret store. The
+  # backend and auth come from Terraform's output contract, so this block is
+  # identical on AWS, GCP and Azure.
+  externalSecrets:
+    enabled: true
+    secretStoreRef:
+      name: skyl-secret-store
+      kind: ClusterSecretStore
+    refreshInterval: 1h
+
+    # Keys to pull. `remoteKey` is the name in the cloud secret store;
+    # `secretKey` is the environment variable the gateway reads.
+    data:
+      - secretKey: SKYL_AUTH_TOKEN
+        remoteKey: skyl-gateway-auth-token
+      - secretKey: ANTHROPIC_API_KEY
+        remoteKey: skyl-anthropic-api-key
+
+  # Escape hatch for kind and CI, where there is no cloud secret store. Never
+  # set in an environment that reaches a real provider; policy rejects it.
+  existingSecret: ""
+
+# --- networking --------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+  annotations: {}
+
+ingress:
+  enabled: false
+  # From Terraform's output contract: "nginx" everywhere by default, since
+  # ingress-nginx behaves identically on all three clouds.
+  className: nginx
+  annotations: {}
+  hosts: []
+  tls: []
+
+  # SSE streaming needs a long read timeout; the ingress-nginx default of 60s
+  # truncates a long generation mid-stream. Applied as annotations in
+  # templates/ingress.yaml so the value is visible rather than buried.
+  streamingTimeoutSeconds: 600
+
+networkPolicy:
+  enabled: true
+  # Who may reach :8080. Defaults to the ingress controller only.
+  ingressNamespaceSelector:
+    kubernetes.io/metadata.name: ingress-nginx
+  # Who may scrape /metrics.
+  metricsNamespaceSelector:
+    kubernetes.io/metadata.name: monitoring
+  # Egress is DNS plus 443. The gateway talks to provider APIs over HTTPS and
+  # nothing else; it has no database and no cache.
+  extraEgress: []
+
+# --- scheduling and resilience -----------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    # No CPU limit. The gateway is I/O-bound and throttling it adds latency to
+    # request handling for no isolation benefit that the request does not
+    # already provide. Memory is limited because a leak should be killed.
+    memory: 512Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+  # Average in-flight requests per pod to target. The better signal for an
+  # I/O-bound service, but it needs prometheus-adapter publishing
+  # `skyl_gateway_inflight` — see docs/observability.md for the rule. Without
+  # the adapter the HPA errors and stops scaling on CPU as well, so this
+  # defaults off. Must be below config.maxConcurrent; rendering fails if not.
+  targetConcurrency: 0
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Spread across zones so a zonal failure cannot take every replica. Scheduled
+# as ScheduleAnyway: on a single-zone dev cluster a DoNotSchedule constraint
+# leaves pods Pending forever.
+topologySpreadConstraints:
+  enabled: true
+  maxSkew: 1
+  topologyKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: ScheduleAnyway
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+# --- lifecycle ---------------------------------------------------------------
+#
+# Do not lower this. The gateway's documented worst case is ~32s: a 2s drain
+# delay so the load balancer notices /readyz going 503, then up to 30s of
+# shutdown grace for in-flight work. A shorter period SIGKILLs the process
+# mid-drain and truncates live streams. Policy enforces >= 40.
+terminationGracePeriodSeconds: 40
+
+probes:
+  # Liveness asks "is the process alive?" — /healthz stays 200 while draining,
+  # deliberately. Pointing this at /readyz would have the kubelet restart the
+  # pod during every graceful shutdown, which is the exact opposite of what
+  # the drain is for.
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+  # Readiness asks "should traffic come here?" — 503 the moment draining
+  # starts. This is what the load balancer polls.
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    timeoutSeconds: 3
+    # One failure is enough. Two 5s periods of continued traffic during a
+    # drain is most of the 2s window the gateway gives the load balancer.
+    failureThreshold: 1
+
+  # Config validation happens before the listener binds, so a slow start means
+  # a bad value, not a cold cache. Fail reasonably fast.
+  startup:
+    path: /healthz
+    periodSeconds: 3
+    failureThreshold: 10
+
+# --- observability -----------------------------------------------------------
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+
+prometheusRule:
+  enabled: true
+  labels: {}
+  # The runbook's alert, encoded. A stream still running when the grace period
+  # expires logs a WARN and the process still exits 0 — so this cannot be
+  # alerted on via exit code or restart count, only via the log line or this
+  # metric. See docs/runbook.md.
+  gracePeriodExpiryThreshold: 0
+
+podAnnotations: {}
+podLabels: {}
+extraEnv: []

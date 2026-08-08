@@ -1,0 +1,49 @@
+skyl-gateway {{ .Chart.AppVersion }} — release {{ .Release.Name }} in {{ .Release.Namespace }}
+
+Image:
+  {{ include "skyl-gateway.image" . }}
+
+Check it came up:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "skyl-gateway.fullname" . }}
+
+{{- if not .Values.secrets.existingSecret }}
+{{- if .Values.secrets.externalSecrets.enabled }}
+
+Secrets are synced by External Secrets. If pods are in CrashLoopBackOff, check
+this first — the gateway treats "no provider key" as fatal, so an unsynced
+secret looks like a broken image:
+
+  kubectl -n {{ .Release.Namespace }} get externalsecret {{ include "skyl-gateway.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} describe externalsecret {{ include "skyl-gateway.fullname" . }}
+{{- end }}
+{{- end }}
+
+Reach it:
+{{- if .Values.ingress.enabled }}
+{{- range .Values.ingress.hosts }}
+  https://{{ .host }}/v1/providers
+{{- end }}
+{{- else }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "skyl-gateway.fullname" . }} 8080:{{ .Values.service.port }}
+  curl -H "Authorization: Bearer $SKYL_AUTH_TOKEN" localhost:8080/v1/providers
+{{- end }}
+
+Two things worth knowing before you page someone:
+
+  * /healthz stays 200 while the pod is draining, on purpose. Use /readyz to
+    ask whether traffic should go there.
+
+  * A rollout can take ~32s per pod. That is the documented drain, not a hang.
+
+{{- if lt (int .Values.terminationGracePeriodSeconds) 40 }}
+
+WARNING: terminationGracePeriodSeconds is {{ .Values.terminationGracePeriodSeconds }},
+below the 40 the gateway needs. Pods will be SIGKILLed mid-drain and live
+streams truncated.
+{{- end }}
+{{- if and (not .Values.image.digest) .Values.image.allowMutableTag }}
+
+WARNING: deploying by mutable tag ({{ .Values.image.tag }}). Rollbacks are not
+reproducible. Acceptable for kind; not for a cluster anyone depends on.
+{{- end }}

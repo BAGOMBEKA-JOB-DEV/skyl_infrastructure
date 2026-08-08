@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bad-gateway
+spec:
+  replicas: 1
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata: {}
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      containers:
+        - name: gateway
+          image: ghcr.io/bagombeka-job-dev/skyl-gateway:latest
+          env:
+            - name: ANTHROPIC_API_KEY
+              value: sk-ant-hardcoded-oops
+          livenessProbe:
+            httpGet: {path: /readyz, port: http}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+          startupProbe:
+            exec: {command: [/bin/sh, -c, "true"]}
+          securityContext:
+            allowPrivilegeEscalation: true
+          resources: {}

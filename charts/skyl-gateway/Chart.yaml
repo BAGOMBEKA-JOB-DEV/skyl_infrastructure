@@ -1,0 +1,36 @@
+apiVersion: v2
+name: skyl-gateway
+description: skyl-gateway — one authenticated endpoint fanning out to every model provider
+type: application
+
+# The chart version moves independently of the app. A change to a probe or a
+# NetworkPolicy is a chart release with no new image.
+version: 0.1.0
+
+# Tracks the gateway module's own version. This is informational: what actually
+# gets deployed is the digest in values.yaml, because a tag is mutable and a
+# digest is not.
+appVersion: "0.1.0"
+
+home: https://github.com/BAGOMBEKA-JOB-DEV/skyl
+sources:
+  - https://github.com/BAGOMBEKA-JOB-DEV/skyl
+  - https://github.com/BAGOMBEKA-JOB-DEV/skyl_infrastructure
+license: Apache-2.0
+
+keywords:
+  - ai
+  - llm
+  - gateway
+  - anthropic
+  - openai
+
+maintainers:
+  - name: BAGOMBEKA JOB
+    url: https://github.com/BAGOMBEKA-JOB-DEV
+
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/signKey: |
+    fingerprint: keyless (sigstore)
+    url: https://github.com/BAGOMBEKA-JOB-DEV/skyl/pkgs/container/skyl-gateway

@@ -1,0 +1,81 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+# Default-deny, then allow exactly what the gateway needs.
+#
+# This matters more here than for a typical service: the pod holds provider API
+# keys and can reach any HTTPS endpoint. Constraining egress means a compromised
+# process cannot quietly exfiltrate those keys to an arbitrary host.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "skyl-gateway.fullname" . }}
+  labels:
+    {{- include "skyl-gateway.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "skyl-gateway.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+
+  ingress:
+    # The API, from the ingress controller only. Nothing else in the cluster
+    # has business calling the gateway directly.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml $np.ingressNamespaceSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.targetPort }}
+
+    {{- if .Values.serviceMonitor.enabled }}
+    # Prometheus, for /metrics. This is a separate rule rather than a wider
+    # selector because /metrics is served on the same port as the API — so
+    # allowing the monitoring namespace here also grants it the API surface,
+    # and that is a deliberate, visible trade rather than an accident.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml $np.metricsNamespaceSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.targetPort }}
+    {{- end }}
+
+  egress:
+    # DNS. Provider hostnames are resolved on every connection.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # HTTPS to the providers. Kubernetes NetworkPolicy cannot express "these
+    # hostnames", only CIDRs, and provider IP ranges are neither published nor
+    # stable — so this is port-scoped rather than destination-scoped. Tightening
+    # it further needs a CNI with FQDN policy (Cilium) or an egress proxy; both
+    # are noted in docs/adr/0004-egress-restriction.md.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # Never let the gateway reach cluster-internal or cloud metadata
+              # addresses. 169.254.169.254 is the instance metadata service on
+              # all three clouds — reachable from a pod by default on some, and
+              # a direct route to node credentials.
+              - 169.254.0.0/16
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+
+    {{- with $np.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

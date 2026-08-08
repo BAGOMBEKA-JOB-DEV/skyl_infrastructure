@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "skyl-gateway.fullname" . }}
+  labels:
+    {{- include "skyl-gateway.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "skyl-gateway.selectorLabels" . | nindent 4 }}
+---
+# A headless companion for the ServiceMonitor.
+#
+# Prometheus discovers pods, not the load-balanced Service; scraping through
+# the ClusterIP would land on one arbitrary replica per interval and silently
+# under-report the fleet.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "skyl-gateway.fullname" . }}-metrics
+  labels:
+    {{- include "skyl-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: metrics
+      port: {{ .Values.service.targetPort }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "skyl-gateway.selectorLabels" . | nindent 4 }}

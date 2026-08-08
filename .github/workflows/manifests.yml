@@ -1,0 +1,147 @@
+name: Manifests
+
+# The Helm chart and the policies that guard it.
+#
+# The policy job is the interesting one. It runs conftest twice: once over the
+# rendered chart, which must pass, and once over policy/fixtures/violations.yaml,
+# which must FAIL. A policy suite that cannot fail is indistinguishable from no
+# policy suite at all, and that failure mode is silent — every rule could be
+# subtly misspelled and CI would stay green.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "charts/**"
+      - "policy/**"
+      - ".github/workflows/manifests.yml"
+  pull_request:
+    paths:
+      - "charts/**"
+      - "policy/**"
+      - ".github/workflows/manifests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Any valid-looking digest. The chart refuses to render without one, and
+  # nothing here pulls the image.
+  TEST_DIGEST: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+jobs:
+  lint:
+    name: helm lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - run: helm lint charts/skyl-gateway --set image.digest=$TEST_DIGEST
+
+  schema:
+    name: kubeconform (k8s ${{ matrix.k8s }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The three versions the cloud modules currently target. A manifest
+        # valid on one and not another is exactly what this catches.
+        k8s: ["1.30.0", "1.31.0", "1.32.0"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.23"
+
+      - run: go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
+
+      # ExternalSecret, ServiceMonitor and PrometheusRule are CRDs, so the
+      # default schema location cannot validate them. Without the catalog they
+      # are silently skipped — which would mean the three most error-prone
+      # objects in the chart go unchecked.
+      - name: render and validate
+        run: |
+          helm template gw charts/skyl-gateway --set image.digest="$TEST_DIGEST" > rendered.yaml
+          kubeconform -strict -summary \
+            -kubernetes-version "${{ matrix.k8s }}" \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            rendered.yaml
+
+  policy:
+    name: conftest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: install conftest
+        run: |
+          curl -sSL "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" \
+            | tar xz conftest
+          sudo mv conftest /usr/local/bin/
+        env:
+          CONFTEST_VERSION: "0.56.0"
+
+      - name: chart satisfies policy
+        run: |
+          helm template gw charts/skyl-gateway --set image.digest="$TEST_DIGEST" > rendered.yaml
+          conftest test --policy policy rendered.yaml
+
+      # The negative test. If this passes, the policies are not doing anything.
+      - name: policy catches known violations
+        run: |
+          if conftest test --policy policy policy/fixtures/violations.yaml; then
+            echo "::error::policy/fixtures/violations.yaml passed conftest. Every rule in policy/ is broken or misspelled — a policy suite that cannot fail is not a policy suite."
+            exit 1
+          fi
+          echo "policies correctly rejected the violation fixture"
+
+  # The chart's guard rails are `fail` calls in templates, which no linter
+  # exercises. Each one below is a defect that reached production somewhere.
+  guardrails:
+    name: chart guard rails
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: rendering fails where it should
+        run: |
+          fail=0
+          must_fail() {
+            desc="$1"; shift
+            if helm template gw charts/skyl-gateway "$@" >/dev/null 2>&1; then
+              echo "::error::chart rendered despite: $desc"
+              fail=1
+            else
+              echo "ok — blocked: $desc"
+            fi
+          }
+
+          must_fail "no image digest"
+          must_fail "digest without sha256: prefix" --set image.digest=deadbeef
+          must_fail "concurrency target at or above SKYL_MAX_CONCURRENT" \
+            --set image.digest="$TEST_DIGEST" --set autoscaling.targetConcurrency=64
+          must_fail "ServiceMonitor enabled while metrics disabled" \
+            --set image.digest="$TEST_DIGEST" --set config.metrics=false
+
+          exit "$fail"
+
+  manifests-ok:
+    name: Manifests
+    if: always()
+    needs: [lint, schema, policy, guardrails]
+    runs-on: ubuntu-latest
+    steps:
+      - name: check results
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "upstream results: $results"
+          for r in $results; do
+            if [ "$r" != "success" ] && [ "$r" != "skipped" ]; then
+              echo "::error::a required job reported $r"
+              exit 1
+            fi
+          done

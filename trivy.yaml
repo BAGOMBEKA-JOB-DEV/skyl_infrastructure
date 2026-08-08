@@ -1,0 +1,28 @@
+# Trivy configuration.
+#
+# Kept in a file rather than as flags on the workflow step so that a local run
+# and CI scan the same thing. A security tool that reports different findings on
+# a laptop than in CI trains people to ignore it.
+#
+#   trivy config .
+#
+# Individual findings are NOT suppressed here. Each one carries an inline
+# `#trivy:ignore:<ID>` comment next to the resource, with the reason, so the
+# justification is visible to whoever is reading the code — not buried in a
+# file they have to go and find.
+
+misconfiguration:
+  # The community VPC and EKS modules bring their own findings. They are real,
+  # but they are not actionable from this repository: fixing them means forking
+  # upstream. Our own configuration of those modules is still scanned.
+  terraform:
+    exclude-downloaded-modules: true
+
+scan:
+  skip-dirs:
+    - "**/.terraform"
+  skip-files:
+    # A deliberately broken manifest. manifests.yml asserts Conftest rejects it;
+    # Trivy finding the same planted defects adds nothing and would bury real
+    # results.
+    - "policy/fixtures/violations.yaml"

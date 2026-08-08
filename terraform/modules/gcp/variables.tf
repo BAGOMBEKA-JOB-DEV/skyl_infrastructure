@@ -104,6 +104,17 @@ variable "secret_names" {
   ]
 }
 
+# Genuinely unused, and deliberately so. CONTRACT.md requires every cloud
+# module to accept `node_count` so the environments can be written once, but
+# Autopilot has no node pools to size — GKE schedules and bills per pod. The
+# variable exists to satisfy the interface.
+#
+# Removing it would break the contract; consuming it would mean inventing a
+# node pool Autopilot does not have.
+#
+# The directive below must stay on the line immediately preceding the block;
+# tflint does not scan back through an intervening comment block.
+# tflint-ignore: terraform_unused_declarations
 variable "node_count" {
   description = "Accepted for contract compatibility. Autopilot has no node pools; it is ignored."
   type        = number

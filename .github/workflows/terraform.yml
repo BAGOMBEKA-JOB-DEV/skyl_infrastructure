@@ -1,0 +1,169 @@
+name: Terraform
+
+# Format, lint, validate and plan every module and environment.
+#
+# Cloud authentication is OIDC federation only — there are no long-lived
+# credentials in repository secrets. Each cloud trusts a role scoped to this
+# repository, so a leaked workflow file grants nothing without the trust policy
+# on the other side.
+#
+# `apply` is deliberately not here. It lives in a job gated by a GitHub
+# Environment with required reviewers, so that an approval is a human decision
+# rather than a merge.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.10.5"
+  TF_IN_AUTOMATION: "true"
+  # Terraform's own colour codes make the PR comment below unreadable.
+  TF_CLI_ARGS: "-no-color"
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive -diff terraform/
+
+  # The contract is the whole basis of the multi-cloud claim, so it is checked
+  # mechanically rather than by review. `terraform validate` only notices a
+  # missing output when something consumes it, which means a dropped output
+  # surfaces at the first environment that needs it rather than here.
+  contract:
+    name: output contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: every cloud module implements CONTRACT.md
+        run: |
+          required="cluster_name cluster_endpoint cluster_ca_certificate \
+                    cluster_version oidc_issuer_url workload_identity_annotation \
+                    secret_store_backend secret_store_config ingress_class \
+                    node_architecture region"
+          fail=0
+          for cloud in aws gcp azure; do
+            for out in $required; do
+              if ! grep -q "^output \"$out\"" "terraform/modules/$cloud/outputs.tf"; then
+                echo "::error file=terraform/modules/$cloud/outputs.tf::missing required output '$out' (see terraform/modules/CONTRACT.md)"
+                fail=1
+              fi
+            done
+          done
+          [ "$fail" -eq 0 ] && echo "all three cloud modules satisfy the contract"
+          exit "$fail"
+
+      # The platform module must never learn which cloud it is on. One
+      # exception is allowed and named explicitly: the ClusterSecretStore
+      # provider block, where the three backends genuinely differ.
+      - name: platform module stays cloud-agnostic
+        run: |
+          # Two exemptions, both narrow:
+          #
+          #  - comments. Matched after grep -n's "file:line:" prefix rather
+          #    than at start of line; `^\s*#` never matches once grep has
+          #    prepended the filename, and an earlier version of this check
+          #    flagged its own explanatory comment because of it.
+          #
+          #  - the `contains([...])` validation that declares the permitted
+          #    secret_store_backend values. Exempting the whole line is safe;
+          #    exempting every line mentioning `secret_store_backend` was not,
+          #    because `var.secret_store_backend == "aws" ? x : y` would then
+          #    pass — which is exactly the conditional this check exists to
+          #    catch.
+          #
+          # The map keys in the ClusterSecretStore merge are unquoted
+          # (`aws = {`), so they never match in the first place.
+          # Captured into a variable and tested for emptiness rather than
+          # branching on the pipeline's exit status. `if <pipeline>; then` reads
+          # more naturally but makes the result depend on grep's exit code
+          # surviving two more pipe stages, which is easy to get subtly wrong —
+          # and a check that silently always passes is worse than no check.
+          leaks=$(grep -nE '(var\.cloud|"aws"|"gcp"|"azure")' terraform/modules/platform/*.tf \
+                    | grep -vE ':[0-9]+:[[:space:]]*#' \
+                    | grep -vE 'contains\(\[' || true)
+
+          if [ -n "$leaks" ]; then
+            echo "$leaks"
+            echo "::error::terraform/modules/platform references a specific cloud outside the ClusterSecretStore block. Push the difference down into the cloud module — see terraform/modules/CONTRACT.md."
+            exit 1
+          fi
+          echo "platform module is cloud-agnostic"
+
+  validate:
+    name: validate ${{ matrix.dir }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir:
+          - terraform/modules/aws
+          - terraform/modules/gcp
+          - terraform/modules/azure
+          - terraform/modules/platform
+          - terraform/environments/dev/aws
+          - terraform/environments/dev/gcp
+          - terraform/environments/dev/azure
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # -backend=false: validation must not need credentials or a state bucket.
+      # This is what lets a fork's PR be checked.
+      - run: terraform init -backend=false -input=false
+        working-directory: ${{ matrix.dir }}
+
+      - run: terraform validate
+        working-directory: ${{ matrix.dir }}
+
+  lint:
+    name: tflint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: terraform-linters/setup-tflint@6e1e0642c0289bd619021bf6b34e3c08ed1e005a # v6.3.0
+        with:
+          tflint_version: v0.64.0
+      - run: tflint --init
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: tflint --recursive --format compact
+
+  # A single check for branch protection to require, so the matrix above can
+  # grow without the repository settings going stale.
+  terraform-ok:
+    name: Terraform
+    if: always()
+    needs: [fmt, contract, validate, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: check results
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "upstream results: $results"
+          for r in $results; do
+            if [ "$r" != "success" ] && [ "$r" != "skipped" ]; then
+              echo "::error::a required job reported $r"
+              exit 1
+            fi
+          done

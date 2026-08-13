@@ -43,7 +43,7 @@ locals {
 
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
-  version = "5.16.0"
+  version = "5.21.0"
 
   name = local.cluster_name
   cidr = var.vpc_cidr
@@ -84,7 +84,7 @@ module "vpc" {
 
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
-  version = "20.31.6"
+  version = "20.37.2"
 
   cluster_name    = local.cluster_name
   cluster_version = var.cluster_version
@@ -183,7 +183,7 @@ resource "aws_iam_policy" "external_secrets" {
 
 module "external_secrets_irsa" {
   source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
-  version = "5.48.0"
+  version = "5.60.0"
 
   role_name = "${local.cluster_name}-external-secrets"
 

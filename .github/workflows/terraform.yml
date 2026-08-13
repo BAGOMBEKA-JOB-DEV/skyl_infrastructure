@@ -1,15 +1,34 @@
 name: Terraform
 
-# Format, lint, validate and plan every module and environment.
+# Format, lint and validate every module and environment, and check that the
+# multi-cloud contract still holds.
 #
-# Cloud authentication is OIDC federation only — there are no long-lived
-# credentials in repository secrets. Each cloud trusts a role scoped to this
-# repository, so a leaked workflow file grants nothing without the trust policy
-# on the other side.
+# What this does NOT do, stated plainly because an earlier version of this
+# comment claimed otherwise:
 #
-# `apply` is deliberately not here. It lives in a job gated by a GitHub
-# Environment with required reviewers, so that an approval is a human decision
-# rather than a merge.
+#   * There is no `terraform plan` job. Every job here runs with
+#     `-backend=false` and no credentials, which proves the configuration
+#     parses and type-checks — not that it would produce a working cluster.
+#   * There is no `terraform apply` job anywhere in this repository.
+#   * No cloud OIDC federation is configured. No roles, no trust policies, no
+#     GitHub Environments exist on any of the three clouds.
+#
+# Adding a plan job needs all of that built first, and the order matters: the
+# trust policy on the cloud side has to exist before a workflow can assume
+# anything, and it must be scoped to this repository and ideally to a specific
+# environment. A plan job wired to a long-lived access key would be worse than
+# no plan job — it puts a credential with read access to your whole account
+# into repository secrets, where a malicious workflow change can exfiltrate it.
+#
+# So the sequence, when someone picks this up:
+#
+#   1. Create the federated identity per cloud, scoped to this repo.
+#   2. Add a `plan` job using it, posting the plan as a PR comment.
+#   3. Add `apply` behind a GitHub Environment with required reviewers, so an
+#      approval is a human decision rather than a side effect of a merge.
+#
+# Until step 1 exists, this workflow is a linter. That is useful, and it is not
+# what "validated infrastructure" usually means.
 on:
   push:
     branches: [main]
@@ -121,6 +140,13 @@ jobs:
           - terraform/environments/dev/aws
           - terraform/environments/dev/gcp
           - terraform/environments/dev/azure
+          # prod matters here beyond coverage: until these existed, every
+          # `var.environment == "prod"` branch in the modules was unreachable —
+          # purge protection, flow logs, the paid AKS SKU, retention windows.
+          # Validating them is the only thing currently exercising those paths.
+          - terraform/environments/prod/aws
+          - terraform/environments/prod/gcp
+          - terraform/environments/prod/azure
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1

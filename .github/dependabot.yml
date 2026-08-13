@@ -1,0 +1,67 @@
+# Dependabot for the two things this repository actually pins.
+#
+# Every action here is pinned by commit SHA, which is the right call for supply
+# chain — a tag can be moved, a SHA cannot — and it has one cost: a pinned SHA
+# never picks up a security fix on its own. Something has to tell you. This is
+# that something.
+#
+# Terraform providers and modules are pinned too (`~> 5.70`, `version =
+# "20.31.6"`), and Dependabot understands both.
+#
+# Deliberately NOT here: the Helm chart versions in modules/platform/variables.tf
+# (ingress-nginx, cert-manager, kube-prometheus-stack). Dependabot has no Helm
+# ecosystem, and those are plain strings it cannot see. They need checking by
+# hand — an ingress-controller upgrade is not something to take automatically
+# anyway, since it can change SSE behaviour the gateway depends on.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+      day: monday
+      time: "06:00"
+      timezone: Africa/Kampala
+    # Monthly, not weekly. Five workflows across a handful of actions do not
+    # change often enough to be worth a PR a week, and a queue of stale bot PRs
+    # is worse than none — it trains you to ignore the notification.
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # One PR for routine bumps rather than five. Security updates are not
+      # grouped and arrive on their own, so they are never buried in a batch.
+      actions:
+        update-types: [minor, patch]
+    labels:
+      - dependencies
+
+  - package-ecosystem: terraform
+    directories:
+      - "/terraform/modules/aws"
+      - "/terraform/modules/gcp"
+      - "/terraform/modules/azure"
+      - "/terraform/modules/platform"
+      - "/terraform/bootstrap/aws"
+      - "/terraform/bootstrap/gcp"
+      - "/terraform/bootstrap/azure"
+    schedule:
+      interval: monthly
+      day: monday
+      time: "06:00"
+      timezone: Africa/Kampala
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      providers:
+        update-types: [minor, patch]
+    labels:
+      - dependencies
+    ignore:
+      # A provider major is a breaking change by definition — azurerm 5 will
+      # remove the arguments deprecated in 4.x, several of which this repository
+      # uses. That is a deliberate migration, not a dependency bump.
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]

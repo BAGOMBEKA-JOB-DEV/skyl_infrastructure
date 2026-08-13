@@ -129,10 +129,151 @@ jobs:
 
           exit "$fail"
 
+  # Everything above proves the chart RENDERS correctly. None of it proves a pod
+  # starts.
+  #
+  # This job deploys the chart to a real kind cluster and asserts the one claim
+  # the whole runbook rests on: during a graceful shutdown /healthz keeps
+  # returning 200 while /readyz starts returning 503. That divergence is why
+  # liveness and readiness point at different endpoints, and until now it had
+  # been verified against a bare binary but never through a kubelet.
+  cluster:
+    name: kind — probes, drain, auth
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The gateway image is not published yet, so build it from source. The
+      # build context must be the skyl repository root — the gateway module
+      # resolves its siblings through `replace => ..`.
+      - name: check out skyl
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: BAGOMBEKA-JOB-DEV/skyl
+          path: skyl-src
+
+      - name: build the gateway image
+        run: docker build -t skyl-gateway:kind ./skyl-src
+
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          cluster_name: skyl
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: load the image into the cluster
+        run: kind load docker-image skyl-gateway:kind --name skyl
+
+      # No External Secrets Operator here, so the chart's escape hatch supplies
+      # the Secret directly. ANTHROPIC_API_KEY is a dummy: the gateway registers
+      # a provider from the key's *presence* and treats "no provider" as a fatal
+      # startup error, but neither probe touches a provider — so this is enough
+      # to get a running pod without a real credential.
+      - name: create the secret
+        run: |
+          kubectl create namespace skyl
+          kubectl -n skyl create secret generic gw \
+            --from-literal=SKYL_AUTH_TOKEN=test-token \
+            --from-literal=ANTHROPIC_API_KEY=sk-ant-dummy-not-used
+
+      # networkPolicy is off, deliberately, and the reason is the point: kind's
+      # default CNI does not implement NetworkPolicy, so the object would be
+      # accepted by the API server and silently ignored. A test that "passed"
+      # against an unenforced policy would be worse than no test — it would
+      # report a control that is not there. Proving enforcement needs Calico or
+      # Cilium and belongs in a separate job.
+      #
+      # serviceMonitor and prometheusRule are off because their CRDs are absent.
+      - name: install the chart
+        run: |
+          helm install gw charts/skyl-gateway \
+            --namespace skyl \
+            --set image.repository=skyl-gateway \
+            --set image.tag=kind \
+            --set image.allowMutableTag=true \
+            --set image.pullPolicy=Never \
+            --set secrets.externalSecrets.enabled=false \
+            --set secrets.existingSecret=gw \
+            --set serviceMonitor.enabled=false \
+            --set prometheusRule.enabled=false \
+            --set networkPolicy.enabled=false \
+            --set autoscaling.enabled=false \
+            --set replicaCount=2 \
+            --wait --timeout 5m
+
+          kubectl -n skyl get pods -o wide
+
+      - name: probes answer while healthy
+        run: |
+          kubectl -n skyl run curl --image=curlimages/curl:8.11.1 --restart=Never -- sleep 600
+          kubectl -n skyl wait --for=condition=Ready pod/curl --timeout=120s
+
+          svc=gw-skyl-gateway
+
+          code() { kubectl -n skyl exec curl -- curl -sS -o /dev/null -w '%{http_code}' "$@"; }
+
+          test "$(code "http://$svc/healthz")" = 200 || { echo "::error::/healthz not 200"; exit 1; }
+          test "$(code "http://$svc/readyz")"  = 200 || { echo "::error::/readyz not 200"; exit 1; }
+          echo "healthy: /healthz 200, /readyz 200"
+
+          # Auth: 401 without a token, 200 with the right one.
+          test "$(code "http://$svc/v1/providers")" = 401 || { echo "::error::unauthenticated request was not 401"; exit 1; }
+          test "$(code -H 'Authorization: Bearer test-token' "http://$svc/v1/providers")" = 200 || { echo "::error::authenticated request was not 200"; exit 1; }
+          echo "auth: 401 without a token, 200 with one"
+
+      # The claim under test. Sample both endpoints on ONE pod's IP — not the
+      # Service, whose endpoints are removed the moment readiness flips, which
+      # would turn the interesting window into connection refused.
+      - name: /healthz stays 200 while /readyz goes 503 during drain
+        run: |
+          pod=$(kubectl -n skyl get pod -l app.kubernetes.io/name=skyl-gateway \
+                  -o jsonpath='{.items[0].metadata.name}')
+          ip=$(kubectl -n skyl get pod "$pod" -o jsonpath='{.status.podIP}')
+          echo "draining $pod at $ip"
+
+          kubectl -n skyl exec curl -- sh -c "
+            for i in \$(seq 1 40); do
+              h=\$(curl -sS -m 1 -o /dev/null -w '%{http_code}' http://$ip:8080/healthz || echo ERR)
+              r=\$(curl -sS -m 1 -o /dev/null -w '%{http_code}' http://$ip:8080/readyz  || echo ERR)
+              echo \"\$i healthz=\$h readyz=\$r\"
+              sleep 0.25
+            done" > samples.txt 2>&1 &
+          sampler=$!
+
+          sleep 1
+          kubectl -n skyl delete pod "$pod" --grace-period=40 --wait=false
+          wait "$sampler" || true
+
+          echo '--- samples ---'; cat samples.txt
+
+          # The window we care about: readyz 503 while healthz is still 200.
+          if grep -q 'healthz=200 readyz=503' samples.txt; then
+            echo "CONFIRMED: /healthz stayed 200 while /readyz returned 503"
+          else
+            echo "::error::never observed healthz=200 with readyz=503 during drain. Either the drain semantics changed, or the sampler missed the window."
+            exit 1
+          fi
+
+          # And liveness must never have failed — a 5xx on /healthz during the
+          # drain is what would get the pod SIGKILLed mid-request.
+          if grep -qE 'healthz=5[0-9][0-9]' samples.txt; then
+            echo "::error::/healthz returned 5xx during drain; liveness would have restarted the pod mid-shutdown"
+            exit 1
+          fi
+          echo "liveness never failed during the drain"
+
+      - name: diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n skyl get all
+          kubectl -n skyl describe pods
+          kubectl -n skyl logs -l app.kubernetes.io/name=skyl-gateway --tail=100 --all-containers || true
+
   manifests-ok:
     name: Manifests
     if: always()
-    needs: [lint, schema, policy, guardrails]
+    needs: [lint, schema, policy, guardrails, cluster]
     runs-on: ubuntu-latest
     steps:
       - name: check results

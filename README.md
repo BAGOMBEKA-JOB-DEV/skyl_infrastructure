@@ -146,10 +146,14 @@ something nobody recorded. Pinning the digest is what makes "roll back to what
 was running yesterday" a fact rather than a hope — and the chart `fail`s at
 render time rather than deploying a tag.
 
-**No image has been published yet.** skyl's `publish-image.yml` postdates the
-existing `gateway/v0.1.0` tag, so it has not had a tag push to run on — trigger
-it from the Actions tab or on the next release. Until then, build locally and
-load the image into your cluster.
+The current release is **v1.0.0**, published 2026-09-06:
+
+```
+ghcr.io/bagombeka-job-dev/skyl-gateway@sha256:6f00bc8f4861cc49a085a9b336264124e2b6bfffd2d3fe8d9e1a57c6cb3f6f6b
+```
+
+Multi-architecture (amd64 + arm64), cosign-signed, with an SBOM and a
+build-provenance attestation. That digest is what the dev environments pin.
 
 ## Getting started
 

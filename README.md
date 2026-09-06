@@ -1,5 +1,7 @@
 # skyl_infrastructure
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/BAGOMBEKA-JOB-DEV/skyl/gateway.svg)](https://pkg.go.dev/github.com/BAGOMBEKA-JOB-DEV/skyl/gateway)
+
 Deployment infrastructure for
 [skyl-gateway](https://github.com/BAGOMBEKA-JOB-DEV/skyl) — Terraform that
 stands up a Kubernetes cluster on **AWS, GCP or Azure**, one Helm chart that

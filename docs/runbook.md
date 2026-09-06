@@ -63,7 +63,7 @@ terraform apply -var gateway_image_digest=sha256:<digest>
 The digest comes from skyl's `publish-image` workflow summary, or:
 
 ```bash
-crane digest ghcr.io/bagombeka-job-dev/skyl-gateway:0.1.0
+crane digest ghcr.io/bagombeka-job-dev/skyl-gateway:1.0.0
 ```
 
 Verify the signature before deploying anything you did not build:
@@ -77,7 +77,7 @@ cosign verify ghcr.io/bagombeka-job-dev/skyl-gateway@sha256:<digest> \
 ## Rollback
 
 Re-apply with the previous digest. This is the entire reason the chart refuses
-mutable tags: `:0.1.0` today and `:0.1.0` last week are not necessarily the
+mutable tags: `:1.0.0` today and `:1.0.0` last week are not necessarily the
 same bytes, so a tag-based rollback is a guess.
 
 ```bash

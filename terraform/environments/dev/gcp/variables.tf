@@ -13,7 +13,7 @@ variable "gateway_image_digest" {
   description = <<-EOT
     Image digest to deploy. Printed by skyl's publish-image workflow, or:
 
-      crane digest ghcr.io/bagombeka-job-dev/skyl-gateway:0.1.0
+      crane digest ghcr.io/bagombeka-job-dev/skyl-gateway:1.0.0
   EOT
   type        = string
 }
